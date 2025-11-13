@@ -1,46 +1,30 @@
-"""
-Deep Q Network off-policy
-"""
 import torch
 import torch.nn as nn
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+# 固定随机种子，保证可复现性
 np.random.seed(42)
-torch.manual_seed(2)
-
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+torch.backends.cudnn.deterministic = True
 
 class Network(nn.Module):
-    """
-    Network Structure
-    """
-    def __init__(self,
-                 n_features,
-                 n_actions,
-                 n_neuron=10
-                 ):
+    """价值网络：输入状态，输出所有动作的Q值"""
+    def __init__(self, n_features, n_actions, n_neuron=10):
         super(Network, self).__init__()
         self.net = nn.Sequential(
-            nn.Linear(in_features=n_features, out_features=n_neuron, bias=True),
-            nn.Linear(in_features=n_neuron, out_features=n_actions, bias=True),
-            nn.ReLU()
+            nn.Linear(n_features, n_neuron),
+            nn.ReLU(),  # 激活函数移到隐藏层后（输出层无激活，Q值可正可负）
+            nn.Linear(n_neuron, n_actions)
         )
 
     def forward(self, s):
-        """
+        return self.net(s)
 
-        :param s: s
-        :return: q
-        """
-        q = self.net(s)
-        return q
-
-
-class DeepQNetwork(nn.Module):
-    """
-    Q Learning Algorithm
-    """
+class DeepQNetwork:
+    """Off-policy DQN 核心类（不继承nn.Module，避免不必要的梯度追踪）"""
     def __init__(self,
                  n_actions,
                  n_features,
@@ -50,108 +34,125 @@ class DeepQNetwork(nn.Module):
                  replace_target_iter=300,
                  memory_size=500,
                  batch_size=32,
-                 e_greedy_increment=None):
-        super(DeepQNetwork, self).__init__()
-
+                 e_greedy_increment=None,
+                 device=None):
+        # 环境参数
         self.n_actions = n_actions
         self.n_features = n_features
+        # 训练参数
         self.lr = learning_rate
-        self.gamma = reward_decay
-        self.epsilon_max = e_greedy
-        self.replace_target_iter = replace_target_iter
-        self.memory_size = memory_size
-        self.batch_size = batch_size
-        self.epsilon_increment = e_greedy_increment
-        self.epsilon = 0 if e_greedy_increment is not None else self.epsilon_max
+        self.gamma = reward_decay  # 折扣因子
+        self.epsilon_max = e_greedy  # 最大贪婪系数
+        self.replace_target_iter = replace_target_iter  # 目标网络更新间隔
+        self.memory_size = memory_size  # 经验回放池大小
+        self.batch_size = batch_size  # 批次大小
+        self.epsilon_increment = e_greedy_increment  # 贪婪系数增量
+        self.epsilon = 0 if e_greedy_increment is not None else self.epsilon_max  # 初始贪婪系数
 
-        # total learning step
-        self.learn_step_counter = 0
+        # 训练计数
+        self.learn_step_counter = 0  # 学习步数（控制目标网络更新）
+        self.memory_counter = 0  # 经验回放池计数
 
-        # initialize zero memory [s, a, r, s_]
-        # 这里用pd.DataFrame创建的表格作为memory
-        # 表格的行数是memory的大小，也就是transition的个数
-        # 表格的列数是transition的长度，一个transition包含[s, a, r, s_]，其中a和r分别是一个数字，s和s_的长度分别是n_features
-        self.memory = pd.DataFrame(np.zeros((self.memory_size, self.n_features*2+2)))
+        # 经验回放池：shape=(memory_size, n_features*2 + 2) → [s, a, r, s_]
+        self.memory = np.zeros((self.memory_size, self.n_features * 2 + 2), dtype=np.float32)
 
-        # build two network: eval_net and target_net
-        self.eval_net = Network(n_features=self.n_features, n_actions=self.n_actions)
-        self.target_net = Network(n_features=self.n_features, n_actions=self.n_actions)
-        self.loss_function = nn.MSELoss()
+        # 设备配置（CPU/GPU）
+        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # 构建两个网络（eval_net：实时更新；target_net：延迟更新）
+        self.eval_net = Network(n_features, n_actions, n_neuron=10).to(self.device)
+        self.target_net = Network(n_features, n_actions, n_neuron=10).to(self.device)
+        # 冻结目标网络的梯度（避免训练时更新）
+        for param in self.target_net.parameters():
+            param.requires_grad = False
+
+        # 损失函数与优化器
+        self.loss_function = nn.MSELoss()  # 均方误差损失（Q值回归）
         self.optimizer = torch.optim.Adam(self.eval_net.parameters(), lr=self.lr)
 
-        # 记录每一步的误差
+        # 记录训练损失
         self.cost_his = []
 
-
     def store_transition(self, s, a, r, s_):
-        if not hasattr(self, 'memory_counter'):
-            # hasattr用于判断对象是否包含对应的属性。
-            self.memory_counter = 0
-
-        transition = np.hstack((s, [a,r], s_))
-
-        # replace the old memory with new memory
+        """存储经验 (s, a, r, s_) 到经验回放池"""
+        # 拼接状态、动作、奖励、下一状态
+        transition = np.hstack((s, [a, r], s_))
+        # 循环覆盖旧经验
         index = self.memory_counter % self.memory_size
-        self.memory.iloc[index, :] = transition
-
+        self.memory[index, :] = transition
+        # 更新计数
         self.memory_counter += 1
 
     def choose_action(self, observation):
-        observation = observation[np.newaxis, :]
+        """根据观测值选择动作（epsilon-greedy策略）"""
+        # 扩展维度：(n_features,) → (1, n_features)（适配网络输入）
+        observation = observation[np.newaxis, :].astype(np.float32)
+        s = torch.from_numpy(observation).to(self.device)
 
         if np.random.uniform() < self.epsilon:
-            # forward feed the observation and get q value for every actions
-            s = torch.FloatTensor(observation)
-            actions_value = self.eval_net(s)
-            action = [np.argmax(actions_value.detach().numpy())][0]
+            # 贪婪选择：选Q值最大的动作
+            q_values = self.eval_net(s)
+            action = torch.argmax(q_values, dim=1).cpu().numpy()[0]  # 转换为numpy格式
         else:
+            # 随机选择：等概率选择所有动作
             action = np.random.randint(0, self.n_actions)
         return action
 
     def _replace_target_params(self):
-        # 复制网络参数
+        """更新目标网络参数（将eval_net参数复制到target_net）"""
         self.target_net.load_state_dict(self.eval_net.state_dict())
+        # 重新冻结目标网络（防止后续意外更新）
+        for param in self.target_net.parameters():
+            param.requires_grad = False
 
     def learn(self):
-        # check to replace target parameters
+        """从经验回放池中采样，训练eval_net"""
+        # 1. 检查是否需要更新目标网络
         if self.learn_step_counter % self.replace_target_iter == 0:
             self._replace_target_params()
-            print('\ntarget params replaced\n')
+            print(f"\nTarget network updated (step: {self.learn_step_counter})\n")
 
-        # sample batch memory from all memory
-        batch_memory = self.memory.sample(self.batch_size) \
-            if self.memory_counter > self.memory_size \
-            else self.memory.iloc[:self.memory_counter].sample(self.batch_size, replace=True)
+        # 2. 采样批次经验
+        if self.memory_counter >= self.memory_size:
+            # 经验池满：随机采样batch_size个（不重复）
+            sample_index = np.random.choice(self.memory_size, size=self.batch_size, replace=False)
+        else:
+            # 经验池未满：随机采样（允许重复，避免采样数量不足）
+            sample_index = np.random.choice(self.memory_counter, size=self.batch_size, replace=True)
+        batch_memory = self.memory[sample_index, :]
 
-        # run the nextwork
-        s = torch.FloatTensor(batch_memory.iloc[:, :self.n_features].values)
-        s_ = torch.FloatTensor(batch_memory.iloc[:, -self.n_features:].values)
-        q_eval = self.eval_net(s)
-        q_next = self.target_net(s_)
+        # 3. 转换为Tensor并移到目标设备
+        s = torch.from_numpy(batch_memory[:, :self.n_features]).to(self.device)  #  当前状态：(batch_size, n_features)
+        s_ = torch.from_numpy(batch_memory[:, -self.n_features:]).to(self.device)  # 下一状态：(batch_size, n_features)
+        a = torch.from_numpy(batch_memory[:, self.n_features].astype(np.int64)).to(self.device)  # 动作：(batch_size,)
+        r = torch.from_numpy(batch_memory[:, self.n_features + 1]).to(self.device)  # 奖励：(batch_size,)
 
-        # change q_target w.r.t q_eval's action
-        q_target = q_eval.clone()
+        # 4. 计算Q值
+        q_eval = self.eval_net(s).gather(1, a.unsqueeze(1)).squeeze(1)  # 当前Q值：(batch_size,)
+        with torch.no_grad():  # 禁用梯度计算（target_net不更新）
+            q_next = self.target_net(s_).max(dim=1).values  # 下一状态最大Q值：(batch_size,)
+        # 目标Q值：r + gamma * max(Q_next)（Bellman方程）
+        q_target = r + self.gamma * q_next
 
-        # 更新值
-        batch_index = np.arange(self.batch_size, dtype=np.int32)
-        eval_act_index = batch_memory.iloc[:, self.n_features].values.astype(int)
-        reward = batch_memory.iloc[:, self.n_features + 1].values
+        # 5. 训练eval_net
+        loss = self.loss_function(q_eval, q_target)
+        self.optimizer.zero_grad()  # 清空梯度
+        loss.backward()  # 反向传播
+        self.optimizer.step()  # 更新参数
 
-        q_target[batch_index, eval_act_index] = torch.FloatTensor(reward) + self.gamma * q_next.max(dim=1).values
-
-        # train eval network
-        loss = self.loss_function(q_target, q_eval)
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-
-        self.cost_his.append(loss.detach().numpy())
-
-        # increasing epsilon
-        self.epsilon = self.epsilon + self.epsilon_increment if self.epsilon < self.epsilon_max else self.epsilon_max
+        # 6. 记录损失与更新epsilon
+        self.cost_his.append(loss.cpu().detach().numpy())
+        # 递增epsilon到最大值
+        self.epsilon = min(self.epsilon + self.epsilon_increment, self.epsilon_max) if self.epsilon_increment else self.epsilon_max
         self.learn_step_counter += 1
 
     def plot_cost(self):
-        plt.figure()
-        plt.plot(np.arange(len(self.cost_his)), self.cost_his)
+        """绘制训练损失曲线"""
+        plt.figure(figsize=(10, 5))
+        plt.plot(np.arange(len(self.cost_his)), self.cost_his, label='Training Loss')
+        plt.xlabel('Training Steps')
+        plt.ylabel('MSE Loss')
+        plt.title('DQN Training Loss Curve')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
         plt.show()
